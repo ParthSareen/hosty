@@ -62,12 +62,14 @@ function generateToken(): string {
 
 /**
  * Create Vercel serverless function wrapper for Node MCP server
+ * Returns { wrapperPath, createdApiDir } to know what to clean up
  */
 async function createNodeWrapper(
   serverInfo: McpServerInfo,
   _options: DeployOptions
-): Promise<string> {
+): Promise<{ wrapperPath: string; createdApiDir: boolean }> {
   const apiDir = join(serverInfo.path, "api");
+  const apiDirExisted = await fileExists(apiDir);
   await mkdir(apiDir, { recursive: true });
 
   // Create the wrapper that exposes the MCP server over HTTP/SSE
@@ -145,21 +147,22 @@ export default async function handler(req, res) {
   const wrapperPath = join(apiDir, "mcp.js");
   await writeFile(wrapperPath, wrapperCode);
 
-  return wrapperPath;
+  return { wrapperPath, createdApiDir: !apiDirExisted };
 }
 
 /**
  * Create vercel.json if it doesn't exist
+ * Returns true if we created it (so we know to clean it up)
  */
 async function ensureVercelConfig(
   serverInfo: McpServerInfo,
   options: DeployOptions
-): Promise<void> {
+): Promise<boolean> {
   const configPath = join(serverInfo.path, "vercel.json");
 
   // Check if vercel.json exists
   if (await fileExists(configPath)) {
-    return;
+    return false;
   }
 
   const config: Record<string, unknown> = {
@@ -179,6 +182,7 @@ async function ensureVercelConfig(
   }
 
   await writeFile(configPath, JSON.stringify(config, null, 2));
+  return true;
 }
 
 /**
@@ -192,9 +196,9 @@ export async function deploy(
   const authToken = options.authToken || generateToken();
 
   // Create wrapper based on server type
-  let wrapperPath: string;
+  let wrapperInfo: { wrapperPath: string; createdApiDir: boolean };
   if (serverInfo.type === "node") {
-    wrapperPath = await createNodeWrapper(serverInfo, options);
+    wrapperInfo = await createNodeWrapper(serverInfo, options);
   } else {
     // Python support would go here
     return {
@@ -204,7 +208,7 @@ export async function deploy(
   }
 
   // Ensure vercel.json exists
-  await ensureVercelConfig(serverInfo, { ...options, authToken });
+  const createdVercelConfig = await ensureVercelConfig(serverInfo, { ...options, authToken });
 
   // Build the project first if it's TypeScript
   const hasTsConfig = await fileExists(join(serverInfo.path, "tsconfig.json"));
@@ -289,9 +293,20 @@ export async function deploy(
       error: error.stderr || error.message,
     };
   } finally {
-    // Clean up generated wrapper
+    // Clean up generated files
     try {
-      await rm(dirname(wrapperPath), { recursive: true, force: true });
+      if (wrapperInfo.createdApiDir) {
+        // We created the api/ directory, safe to remove it entirely
+        await rm(dirname(wrapperInfo.wrapperPath), { recursive: true, force: true });
+      } else {
+        // api/ existed before, only remove our file
+        await rm(wrapperInfo.wrapperPath, { force: true });
+      }
+
+      // Clean up vercel.json if we created it
+      if (createdVercelConfig) {
+        await rm(join(serverInfo.path, "vercel.json"), { force: true });
+      }
     } catch {
       // Ignore cleanup errors
     }
