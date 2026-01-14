@@ -1,20 +1,11 @@
-/**
- * Detect and validate MCP server projects
- */
-
 import { readFile, access } from "node:fs/promises";
 import { join, basename } from "node:path";
-import type { McpServerInfo, McpServerType } from "./types.js";
+import type { McpServerInfo } from "./types.js";
 
-const NODE_MCP_PACKAGES = [
-  "@modelcontextprotocol/sdk",
-  "mcp",
-  "@anthropic-ai/sdk", // Some use this directly
-];
-
+const NODE_MCP_PACKAGES = ["@modelcontextprotocol/sdk", "mcp"];
 const PYTHON_MCP_PACKAGES = ["mcp", "modelcontextprotocol"];
 
-async function fileExists(path: string): Promise<boolean> {
+async function exists(path: string): Promise<boolean> {
   try {
     await access(path);
     return true;
@@ -23,32 +14,17 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
-async function detectNodeProject(
-  projectPath: string
-): Promise<McpServerInfo | null> {
-  const packageJsonPath = join(projectPath, "package.json");
-
-  if (!(await fileExists(packageJsonPath))) {
-    return null;
-  }
+async function detectNode(dir: string): Promise<McpServerInfo | null> {
+  const pkgPath = join(dir, "package.json");
+  if (!(await exists(pkgPath))) return null;
 
   try {
-    const content = await readFile(packageJsonPath, "utf-8");
-    const pkg = JSON.parse(content);
+    const pkg = JSON.parse(await readFile(pkgPath, "utf-8"));
+    const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+    const hasMcp = NODE_MCP_PACKAGES.some((d) => d in deps);
+    if (!hasMcp) return null;
 
-    const allDeps = {
-      ...pkg.dependencies,
-      ...pkg.devDependencies,
-    };
-
-    const hasMcpDep = NODE_MCP_PACKAGES.some((dep) => dep in allDeps);
-
-    if (!hasMcpDep) {
-      return null;
-    }
-
-    // Find entry point
-    const possibleEntries = [
+    const entries = [
       pkg.main,
       "src/index.ts",
       "src/index.js",
@@ -58,175 +34,100 @@ async function detectNodeProject(
       "server.ts",
     ].filter(Boolean);
 
-    let entryPoint = "";
-    for (const entry of possibleEntries) {
-      if (await fileExists(join(projectPath, entry))) {
-        entryPoint = entry;
+    let entry = "";
+    for (const e of entries) {
+      if (await exists(join(dir, e))) {
+        entry = e;
         break;
       }
     }
 
     const errors: string[] = [];
-    const warnings: string[] = [];
-
-    if (!entryPoint) {
-      errors.push("Could not find entry point (index.ts, server.ts, etc.)");
-    }
-
-    // Check for Vercel compatibility
-    const vercelJsonPath = join(projectPath, "vercel.json");
-    if (!(await fileExists(vercelJsonPath))) {
-      warnings.push("No vercel.json found - will use defaults");
-    }
+    if (!entry) errors.push("No entry point found (index.ts, server.ts, etc.)");
 
     return {
       type: "node",
-      path: projectPath,
-      entryPoint,
-      name: pkg.name || basename(projectPath),
-      transport: "http", // Default for Vercel deployment
+      path: dir,
+      entryPoint: entry,
+      name: pkg.name || basename(dir),
+      transport: "http",
       isValid: errors.length === 0,
       errors,
-      warnings,
+      warnings: [],
     };
   } catch {
     return null;
   }
 }
 
-async function detectPythonProject(
-  projectPath: string
-): Promise<McpServerInfo | null> {
-  // Check for pyproject.toml or requirements.txt
-  const pyprojectPath = join(projectPath, "pyproject.toml");
-  const requirementsPath = join(projectPath, "requirements.txt");
+async function detectPython(dir: string): Promise<McpServerInfo | null> {
+  const pyproject = join(dir, "pyproject.toml");
+  const requirements = join(dir, "requirements.txt");
 
-  const hasPyproject = await fileExists(pyprojectPath);
-  const hasRequirements = await fileExists(requirementsPath);
+  const hasPyproject = await exists(pyproject);
+  const hasRequirements = await exists(requirements);
+  if (!hasPyproject && !hasRequirements) return null;
 
-  if (!hasPyproject && !hasRequirements) {
-    return null;
-  }
+  let hasMcp = false;
+  let name = basename(dir);
 
-  let hasMcpDep = false;
-  let name = basename(projectPath);
-
-  // Check pyproject.toml
   if (hasPyproject) {
     try {
-      const content = await readFile(pyprojectPath, "utf-8");
-      hasMcpDep = PYTHON_MCP_PACKAGES.some((pkg) => content.includes(pkg));
-
-      // Extract name from pyproject.toml (basic parsing)
-      const nameMatch = content.match(/^name\s*=\s*"([^"]+)"/m);
-      if (nameMatch) {
-        name = nameMatch[1];
-      }
-    } catch {
-      // Ignore parse errors
-    }
+      const content = await readFile(pyproject, "utf-8");
+      hasMcp = PYTHON_MCP_PACKAGES.some((p) => content.includes(p));
+      const m = content.match(/^name\s*=\s*"([^"]+)"/m);
+      if (m) name = m[1];
+    } catch {}
   }
 
-  // Check requirements.txt
-  if (!hasMcpDep && hasRequirements) {
+  if (!hasMcp && hasRequirements) {
     try {
-      const content = await readFile(requirementsPath, "utf-8");
-      hasMcpDep = PYTHON_MCP_PACKAGES.some((pkg) => content.includes(pkg));
-    } catch {
-      // Ignore
-    }
+      const content = await readFile(requirements, "utf-8");
+      hasMcp = PYTHON_MCP_PACKAGES.some((p) => content.includes(p));
+    } catch {}
   }
 
-  if (!hasMcpDep) {
-    return null;
-  }
+  if (!hasMcp) return null;
 
-  // Find entry point
-  const possibleEntries = [
-    "server.py",
-    "main.py",
-    "app.py",
-    "src/server.py",
-    "src/main.py",
-    "__main__.py",
-  ];
-
-  let entryPoint = "";
-  for (const entry of possibleEntries) {
-    if (await fileExists(join(projectPath, entry))) {
-      entryPoint = entry;
+  const entries = ["server.py", "main.py", "app.py", "src/server.py", "src/main.py"];
+  let entry = "";
+  for (const e of entries) {
+    if (await exists(join(dir, e))) {
+      entry = e;
       break;
     }
   }
 
   const errors: string[] = [];
-  const warnings: string[] = [];
-
-  if (!entryPoint) {
-    errors.push("Could not find entry point (server.py, main.py, etc.)");
-  }
+  if (!entry) errors.push("No entry point found (server.py, main.py, etc.)");
 
   return {
     type: "python",
-    path: projectPath,
-    entryPoint,
+    path: dir,
+    entryPoint: entry,
     name,
     transport: "http",
     isValid: errors.length === 0,
     errors,
-    warnings,
-  };
-}
-
-/**
- * Detect MCP server in a directory
- */
-export async function detect(projectPath: string): Promise<McpServerInfo> {
-  // Try Node first, then Python
-  const nodeInfo = await detectNodeProject(projectPath);
-  if (nodeInfo) {
-    return nodeInfo;
-  }
-
-  const pythonInfo = await detectPythonProject(projectPath);
-  if (pythonInfo) {
-    return pythonInfo;
-  }
-
-  // Not an MCP project
-  return {
-    type: "node",
-    path: projectPath,
-    entryPoint: "",
-    name: basename(projectPath),
-    transport: "stdio",
-    isValid: false,
-    errors: [
-      "Not an MCP server project. Expected package.json with @modelcontextprotocol/sdk or pyproject.toml with mcp dependency.",
-    ],
     warnings: [],
   };
 }
 
-/**
- * Pretty print detection results
- */
-export function formatDetectionResult(info: McpServerInfo): string {
-  const lines: string[] = [];
+export async function detect(dir: string): Promise<McpServerInfo> {
+  const node = await detectNode(dir);
+  if (node) return node;
 
-  if (info.isValid) {
-    lines.push(`Detected ${info.type} MCP server: ${info.name}`);
-    lines.push(`  Entry: ${info.entryPoint}`);
-  } else {
-    lines.push(`Not a valid MCP server project`);
-    for (const err of info.errors) {
-      lines.push(`  - ${err}`);
-    }
-  }
+  const python = await detectPython(dir);
+  if (python) return python;
 
-  for (const warn of info.warnings) {
-    lines.push(`  Warning: ${warn}`);
-  }
-
-  return lines.join("\n");
+  return {
+    type: "node",
+    path: dir,
+    entryPoint: "",
+    name: basename(dir),
+    transport: "stdio",
+    isValid: false,
+    errors: ["Not an MCP project. Need package.json with @modelcontextprotocol/sdk or pyproject.toml with mcp."],
+    warnings: [],
+  };
 }
