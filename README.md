@@ -89,13 +89,36 @@ export const server = new Server({ name: "my-server", version: "1.0.0" }, {
 
 ### Python
 
-Coming soon.
+Your project needs:
+- `requirements.txt` or `pyproject.toml` with `mcp`
+- Entry point that exports `server` or `mcp_server`
 
-## Example
+```python
+# server.py
+from mcp.server import Server
+
+server = Server("my-server")
+
+@server.list_tools()
+async def list_tools():
+    return [...]
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    ...
+```
+
+## Examples
 
 ```bash
+# Node/TypeScript
 cd examples/hello-mcp
 npm install
+hosty deploy
+
+# Python
+cd examples/hello-mcp-python
+pip install -r requirements.txt
 hosty deploy
 ```
 
