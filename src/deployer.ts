@@ -33,7 +33,7 @@ function generateToken(): string {
   return randomBytes(32).toString("hex");
 }
 
-async function createWrapper(
+async function createNodeWrapper(
   info: McpServerInfo
 ): Promise<{ path: string; createdDir: boolean }> {
   const apiDir = join(info.path, "api");
@@ -90,18 +90,121 @@ export default async function handler(req, res) {
   return { path: wrapperPath, createdDir };
 }
 
-async function createVercelConfig(info: McpServerInfo, token: string): Promise<boolean> {
+async function createPythonWrapper(
+  info: McpServerInfo
+): Promise<{ path: string; createdDir: boolean }> {
+  const apiDir = join(info.path, "api");
+  const createdDir = !(await exists(apiDir));
+  await mkdir(apiDir, { recursive: true });
+
+  // Convert entry point to module path (e.g., src/server.py -> src.server)
+  const modulePath = info.entryPoint.replace(/\.py$/, "").replace(/\//g, ".");
+
+  const code = `
+import os
+import json
+import asyncio
+import importlib
+from http.server import BaseHTTPRequestHandler
+
+# Import the user's MCP server
+try:
+    mod = importlib.import_module("${modulePath}")
+    server = getattr(mod, "server", None) or getattr(mod, "mcp_server", None)
+    if hasattr(mod, "create_server"):
+        server = mod.create_server()
+except Exception as e:
+    print(f"Failed to import MCP server: {e}")
+    server = None
+
+class handler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self._set_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        if not self._check_auth():
+            return
+
+        accept = self.headers.get("Accept", "")
+        if "text/event-stream" in accept:
+            self._handle_sse()
+        else:
+            self._send_json(200, {"status": "ok", "mcp": True})
+
+    def do_POST(self):
+        if not self._check_auth():
+            return
+        self._send_json(200, {"received": True})
+
+    def _set_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+    def _check_auth(self):
+        token = os.environ.get("AUTH_TOKEN")
+        if token:
+            auth = self.headers.get("Authorization", "")
+            if auth != f"Bearer {token}":
+                self._send_json(401, {"error": "Unauthorized"})
+                return False
+        return True
+
+    def _send_json(self, status, data):
+        self.send_response(status)
+        self._set_cors_headers()
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode())
+
+    def _handle_sse(self):
+        if not server:
+            self._send_json(500, {"error": "Server not loaded"})
+            return
+
+        self.send_response(200)
+        self._set_cors_headers()
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+
+        # Note: Full SSE streaming requires async runtime support
+        # This is a simplified handler - for production use mcp[cli] with fastmcp
+        try:
+            from mcp.server.sse import SseServerTransport
+            transport = SseServerTransport("/api/mcp")
+            asyncio.run(server.connect(transport))
+        except Exception as e:
+            self.wfile.write(f"data: {json.dumps({'error': str(e)})}\\n\\n".encode())
+`.trim();
+
+  const wrapperPath = join(apiDir, "mcp.py");
+  await writeFile(wrapperPath, code);
+  return { path: wrapperPath, createdDir };
+}
+
+async function createVercelConfig(
+  info: McpServerInfo,
+  token: string
+): Promise<boolean> {
   const configPath = join(info.path, "vercel.json");
   if (await exists(configPath)) return false;
 
-  await writeFile(
-    configPath,
-    JSON.stringify({
-      version: 2,
-      functions: { "api/mcp.js": { maxDuration: 60 } },
-      env: { AUTH_TOKEN: token },
-    }, null, 2)
-  );
+  const funcKey = info.type === "python" ? "api/mcp.py" : "api/mcp.js";
+  const config: Record<string, unknown> = {
+    version: 2,
+    functions: { [funcKey]: { maxDuration: 60 } },
+    env: { AUTH_TOKEN: token },
+  };
+
+  if (info.type === "python") {
+    config.builds = [{ src: "api/mcp.py", use: "@vercel/python" }];
+  }
+
+  await writeFile(configPath, JSON.stringify(config, null, 2));
   return true;
 }
 
@@ -109,15 +212,17 @@ export async function deploy(
   info: McpServerInfo,
   opts: DeployOptions = {}
 ): Promise<DeploymentResult> {
-  if (info.type !== "node") {
-    return { success: false, error: "Only Node.js MCP servers supported for now" };
-  }
-
   const token = opts.authToken || generateToken();
-  const wrapper = await createWrapper(info);
+
+  // Create appropriate wrapper
+  const wrapper = info.type === "python"
+    ? await createPythonWrapper(info)
+    : await createNodeWrapper(info);
+
   const createdConfig = await createVercelConfig(info, token);
 
-  if (await exists(join(info.path, "tsconfig.json"))) {
+  // Build TypeScript projects
+  if (info.type === "node" && await exists(join(info.path, "tsconfig.json"))) {
     try {
       await execa("npm", ["run", "build"], { cwd: info.path, stdio: "pipe" });
     } catch {}
