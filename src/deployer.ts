@@ -58,7 +58,7 @@ export default async function handler(req, res) {
 
   if (req.method === "OPTIONS") return res.status(200).end();
 
-  const token = process.env.AUTH_TOKEN;
+  const token = process.env.MCP_AUTH_TOKEN;
   if (token && req.headers.authorization !== \`Bearer \${token}\`) {
     return res.status(401).json({ error: "Unauthorized" });
   }
@@ -144,7 +144,7 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
     def _check_auth(self):
-        token = os.environ.get("AUTH_TOKEN")
+        token = os.environ.get("MCP_AUTH_TOKEN")
         if token:
             auth = self.headers.get("Authorization", "")
             if auth != f"Bearer {token}":
@@ -196,8 +196,10 @@ async function createVercelConfig(
   const funcKey = info.type === "python" ? "api/mcp.py" : "api/mcp.js";
   const config: Record<string, unknown> = {
     version: 2,
+    buildCommand: info.type === "node" ? "npm run build" : "",
+    outputDirectory: "public",
     functions: { [funcKey]: { maxDuration: 60 } },
-    env: { AUTH_TOKEN: token },
+    env: { MCP_AUTH_TOKEN: token },
   };
 
   if (info.type === "python") {
@@ -221,6 +223,14 @@ export async function deploy(
 
   const createdConfig = await createVercelConfig(info, token);
 
+  // Create public folder for Vercel output
+  const publicDir = join(info.path, "public");
+  const createdPublic = !(await exists(publicDir));
+  if (createdPublic) {
+    await mkdir(publicDir, { recursive: true });
+    await writeFile(join(publicDir, "index.html"), `<!DOCTYPE html><html><body>MCP Server: ${info.name}</body></html>`);
+  }
+
   // Build TypeScript projects
   if (info.type === "node" && await exists(join(info.path, "tsconfig.json"))) {
     try {
@@ -232,7 +242,7 @@ export async function deploy(
   if (opts.production) args.push("--prod");
   if (opts.team) args.push("--scope", opts.team);
   if (opts.projectName) args.push("--name", opts.projectName);
-  args.push("--env", `AUTH_TOKEN=${token}`);
+  args.push("--env", `MCP_AUTH_TOKEN=${token}`);
 
   if (opts.env) {
     for (const [k, v] of Object.entries(opts.env)) {
@@ -242,11 +252,15 @@ export async function deploy(
 
   try {
     const result = await execa("vercel", args, { cwd: info.path, stdio: "pipe" });
-    const url = result.stdout.trim().split("\n").pop() || "";
+    const deployUrl = result.stdout.trim().split("\n").pop() || "";
 
-    if (!url.startsWith("http")) {
+    if (!deployUrl.startsWith("http")) {
       return { success: false, error: `Unexpected output: ${result.stdout}` };
     }
+
+    // Use production domain for --prod deployments
+    const projectName = opts.projectName || info.name;
+    const url = opts.production ? `https://${projectName}.vercel.app` : deployUrl;
 
     const mcpConfig: McpClientConfig = {
       name: info.name,
@@ -261,7 +275,7 @@ export async function deploy(
       authToken: token,
     });
 
-    return { success: true, url, projectName: opts.projectName || info.name, mcpConfig };
+    return { success: true, url, projectName, mcpConfig };
   } catch (e) {
     const err = e as Error & { stderr?: string };
     return { success: false, error: err.stderr || err.message };
@@ -274,6 +288,9 @@ export async function deploy(
       }
       if (createdConfig) {
         await rm(join(info.path, "vercel.json"), { force: true });
+      }
+      if (createdPublic) {
+        await rm(publicDir, { recursive: true, force: true });
       }
     } catch {}
   }
