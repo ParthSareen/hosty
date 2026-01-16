@@ -73,7 +73,11 @@ program
     console.log("");
     console.log(chalk.dim("─".repeat(50)));
     console.log("");
-    console.log("Add to Claude Desktop config:");
+    console.log("Add to Claude Code:");
+    console.log("");
+    console.log(`  claude mcp add --transport http ${info.name} ${result.mcpConfig?.transport.url} --header "Authorization: Bearer ${result.mcpConfig?.auth?.token}"`);
+    console.log("");
+    console.log(chalk.dim("Or add to Claude Desktop config:"));
     console.log("");
     console.log(generateClaudeDesktopConfig(result.mcpConfig!));
     console.log("");
